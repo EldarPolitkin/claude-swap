@@ -28,6 +28,7 @@ import ipaddress
 import json
 import logging
 import ssl
+import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -299,6 +300,11 @@ class ProxyServer(ThreadingHTTPServer):
     # The default backlog of 5 refuses connections when many sessions start
     # requests at once (a fleet of agents behind one proxy).
     request_queue_size = 128
+    # HTTPServer sets SO_REUSEADDR. On POSIX that only skips TIME_WAIT; on
+    # Windows it lets a second socket bind a port that is already listening,
+    # so a busy port would not be reported and another process could take
+    # over the relay.
+    allow_reuse_address = sys.platform != "win32"
 
     def __init__(self, address: tuple[str, int], recorder: _Recorder, upstream: Upstream):
         self.recorder = recorder
@@ -415,7 +421,7 @@ class _Handler(BaseHTTPRequestHandler):
             if chunked:
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             self.close_connection = True  # the client went away mid-stream
             return False
         return True

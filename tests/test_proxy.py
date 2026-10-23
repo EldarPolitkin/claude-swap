@@ -303,7 +303,7 @@ class FakeUpstream:
                         self.wfile.flush()
                     self.wfile.write(b"0\r\n\r\n")
                     self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     upstream.broken_pipe.set()
 
             do_GET = do_POST = _serve
@@ -583,6 +583,49 @@ class TestUpstreamReuse:
 
     def test_a_listen_backlog_sized_for_a_fleet_of_sessions(self):
         assert ProxyServer.request_queue_size >= 64
+
+    def test_no_address_reuse_on_windows(self):
+        # On Windows SO_REUSEADDR lets a second process bind a port that is
+        # already listening: the proxy would start "fine" on a port someone
+        # else holds, and another process could take over the relay.
+        import sys
+
+        assert ProxyServer.allow_reuse_address is (sys.platform != "win32")
+
+    def test_an_aborted_client_connection_is_not_an_error(self, running, monkeypatch):
+        # Windows reports a client that hung up as ConnectionAbortedError.
+        server, _ = running
+        handler = proxy._Handler.__new__(proxy._Handler)
+
+        class Gone:
+            def write(self, data):
+                raise ConnectionAbortedError
+
+            def flush(self):
+                pass
+
+        class OneChunk:
+            def __init__(self):
+                self.sent = False
+
+            def read1(self, n):
+                if self.sent:
+                    return b""
+                self.sent = True
+                return b"x"
+
+            def getheader(self, name):
+                return None
+
+        handler.wfile = Gone()
+        handler.close_connection = False
+        monkeypatch.setattr(handler, "send_response_only", lambda *a: None, raising=False)
+        monkeypatch.setattr(handler, "send_header", lambda *a: None, raising=False)
+        monkeypatch.setattr(handler, "end_headers", lambda: None, raising=False)
+        resp = OneChunk()
+        resp.status, resp.reason = 200, "OK"
+        assert handler._send_reply(resp, []) is False
+        assert handler.close_connection is True
 
 
 class FakeConn:
