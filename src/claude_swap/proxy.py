@@ -348,11 +348,24 @@ def _require_loopback(host: str) -> None:
         )
 
 
-def run_proxy(host: str, port: int, switcher) -> int:
+def run_proxy(
+    host: str,
+    port: int,
+    switcher,
+    on_listening: Callable[[str, int], None] | None = None,
+) -> int:
     """Serve until interrupted. Returns the process exit code.
+
+    Args:
+        host: Loopback address to listen on.
+        port: Port to listen on (0 picks a free one).
+        switcher: Initialized ClaudeAccountSwitcher.
+        on_listening: Called with the bound address once the socket is
+            listening, so a caller never announces a port it failed to take.
 
     Raises:
         ValueError: ``host`` is not a loopback IPv4 address or ``localhost``.
+        OSError: the address could not be bound (port in use, ...).
     """
     _require_loopback(host)
     recorder = LiveUsageRecorder(switcher._usage_store, SwitcherSlotResolver(switcher))
@@ -366,6 +379,8 @@ def run_proxy(host: str, port: int, switcher) -> int:
         bound_host,
         bound_port,
     )
+    if on_listening is not None:
+        on_listening(bound_host, bound_port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -249,6 +249,8 @@ class FakeUpstream:
         self.chunks: list[bytes] = [b"event: one\n\n", b"event: two\n\n"]
         self.between_chunks = threading.Event()
         self.between_chunks.set()
+        self.chunked = True
+        self.broken_pipe = threading.Event()
         upstream = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -278,15 +280,24 @@ class FakeUpstream:
                 self.send_response(upstream.status)
                 for k, v in upstream.headers.items():
                     self.send_header(k, v)
+                if not upstream.chunked:
+                    payload = b"".join(upstream.chunks)
+                    self.send_header("content-length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 self.send_header("transfer-encoding", "chunked")
                 self.end_headers()
-                for i, chunk in enumerate(upstream.chunks):
-                    if i:
-                        upstream.between_chunks.wait(5)
-                    self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+                try:
+                    for i, chunk in enumerate(upstream.chunks):
+                        if i:
+                            upstream.between_chunks.wait(5)
+                        self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+                        self.wfile.flush()
+                    self.wfile.write(b"0\r\n\r\n")
                     self.wfile.flush()
-                self.wfile.write(b"0\r\n\r\n")
-                self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    upstream.broken_pipe.set()
 
             do_GET = do_POST = _serve
 
@@ -458,6 +469,63 @@ class TestPassThrough:
         assert sent["host"] == f"127.0.0.1:{upstream.port}"
 
 
+class TestConnections:
+    def test_a_content_length_reply_keeps_its_length(self, running, upstream):
+        upstream.chunked = False
+        upstream.chunks = [b'{"ok":', b"true}"]
+        server, _ = running
+        conn, resp = _post(server)
+        assert resp.getheader("content-length") == "11"
+        assert resp.getheader("transfer-encoding") is None
+        assert resp.read() == b'{"ok":true}'
+        conn.close()
+
+    def test_two_requests_share_one_client_connection(self, running, upstream):
+        # Claude Code keeps its connection to the base URL alive between calls.
+        server, _ = running
+        conn = _client(server)
+        for _ in range(2):
+            conn.request("POST", "/v1/messages", body=b"{}", headers={"authorization": f"Bearer {TOKEN}"})
+            assert conn.getresponse().read() == b"event: one\n\nevent: two\n\n"
+        conn.close()
+        assert len(upstream.requests) == 2
+
+    def test_a_client_that_leaves_mid_stream_does_not_stop_the_proxy(self, running, upstream):
+        upstream.chunks = [b"event: one\n\n"] + [b"x" * 65536] * 64
+        upstream.between_chunks.clear()
+        server, _ = running
+        conn, resp = _post(server)
+        assert resp.read1(64) == b"event: one\n\n"
+        conn.sock.close()  # the session is killed mid-reply
+        conn.close()
+        upstream.between_chunks.set()
+        upstream.chunks = [b"next"]
+        conn2, resp2 = _post(server)
+        assert resp2.read() == b"next"
+        conn2.close()
+
+    def test_request_trailers_are_consumed(self, running, upstream):
+        server, _ = running
+        conn = _client(server)
+        conn.putrequest("POST", "/v1/messages")
+        conn.putheader("transfer-encoding", "chunked")
+        conn.endheaders()
+        conn.send(b"2\r\n{}\r\n0\r\nx-trailer: 1\r\n\r\n")
+        conn.getresponse().read()
+        conn.close()
+        assert upstream.requests[0]["body"] == b"{}"
+
+    def test_a_malformed_request_line_is_answered_not_crashed(self, running, upstream):
+        import socket
+
+        server, _ = running
+        with socket.create_connection(server.server_address[:2], timeout=5) as sock:
+            sock.sendall(b"NONSENSE\r\n\r\n")
+            reply = sock.recv(256)
+        assert reply.startswith(b"HTTP/1.1 400") or reply.startswith(b"HTTP/1.0 400")
+        assert upstream.requests == []
+
+
 class TestRefusals:
     def test_an_absolute_url_is_refused_so_it_is_no_open_proxy(self, running, upstream):
         server, spy = running
@@ -521,6 +589,15 @@ class TestRunProxy:
         with pytest.raises(ValueError, match="loopback"):
             proxy.run_proxy(host=host, port=0, switcher=FakeSwitcher())
 
+    def test_localhost_is_accepted(self, monkeypatch, tmp_path):
+        def interrupted(self):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(ProxyServer, "serve_forever", interrupted)
+        sw = FakeSwitcher()
+        sw._usage_store = UsageStore(tmp_path / "cache")
+        assert proxy.run_proxy(host="localhost", port=0, switcher=sw) == 0
+
     def test_serves_until_interrupted(self, monkeypatch, tmp_path, caplog):
         caplog.set_level(logging.INFO, logger="claude-swap")
         served = {}
@@ -532,6 +609,16 @@ class TestRunProxy:
         monkeypatch.setattr(ProxyServer, "serve_forever", fake_serve_forever)
         sw = FakeSwitcher()
         sw._usage_store = UsageStore(tmp_path / "cache")
-        assert proxy.run_proxy(host="127.0.0.1", port=0, switcher=sw) == 0
+        announced = []
+        assert (
+            proxy.run_proxy(
+                host="127.0.0.1",
+                port=0,
+                switcher=sw,
+                on_listening=lambda h, p: announced.append((h, p)),
+            )
+            == 0
+        )
         assert served["address"][0] == "127.0.0.1"
+        assert announced == [served["address"][:2]]
         assert "ANTHROPIC_BASE_URL=http://127.0.0.1:" in caplog.text
