@@ -18,7 +18,7 @@ IDENT = {"1": ("a@x.com", ""), "2": ("b@x.com", "org-2")}
 POLLED = {
     "five_hour": {"pct": 25.0},
     "seven_day": {"pct": 10.0},
-    "scoped": [{"model": "Fable", "pct": 30.0}],
+    "scoped": [{"name": "Fable", "pct": 30.0}],
     "spend": {"pct": 5.0, "used": 1.0, "limit": 20.0, "currency": "USD"},
 }
 LIVE = {"five_hour": {"pct": 87.0}, "seven_day": {"pct": 41.0}}

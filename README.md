@@ -341,6 +341,7 @@ cswap auto                                         # unchanged: now decides on l
 <summary>How it works, and what it will not do</summary>
 
 - Each request goes to `api.anthropic.com` unchanged, and the reply (streamed or not, compressed or not) comes back unchanged. On the way the proxy reads the `anthropic-ratelimit-unified-*` headers and records the 5h and 7d windows for the account whose access token sent the request. A token it does not manage writes nothing. A `rejected` reply (HTTP 429) marks that window at its limit, so `auto` leaves at once.
+- `cswap list`, `cswap status`, the dashboard (`cswap tui` / `cswap watch`) and the menu bar show the live numbers as soon as the proxy records them, marked `live` (the dashboard picks them up on its next 3-second repaint and flashes the row).
 - The live reading is kept beside the polled one, not in place of it. Decisions use it while it is newer than the last poll and at most 5 minutes old. The per-model and spend windows the headers do not carry still come from polling, which keeps its own cadence.
 - It listens on loopback only and refuses absolute-form requests, so it cannot be used as a general proxy. It never stores or logs a token or a request or reply body: a token is hashed on arrival and only the hash is compared.
 - While it is not running, sessions that point at it cannot reach the API. Run it under the same supervisor as `cswap auto` (launchd, systemd, a container entrypoint), or set `ANTHROPIC_BASE_URL` only in the sessions you start while it runs.

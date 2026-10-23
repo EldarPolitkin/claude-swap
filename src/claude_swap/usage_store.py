@@ -329,6 +329,38 @@ class UsageEntry:
             return True
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
 
+    @property
+    def shows_live(self) -> bool:
+        """Whether this (display) entry is showing a ``cswap proxy`` reading."""
+        return (
+            self.live_usage is not None
+            and self.live_at is not None
+            and self.fetched_at == self.live_at
+        )
+
+    def for_display(self) -> UsageEntry:
+        """This entry as every display surface should draw it.
+
+        When the live reading is newer than the poll, its 5h/7d windows
+        replace the polled ones (the per-model and spend windows stay), and
+        ``fetched_at``/``age_s`` become the live reading's, so the age note,
+        the stale flag and the TUI's refresh flash all follow it. There is no
+        trust bound here, unlike ``decision_value``: display shows the newest
+        measurement, annotated with its age. Idempotent. For display only:
+        ``fetched_at`` here no longer means "last poll", so nothing that
+        schedules fetches may read an entry this returns.
+        """
+        if self.live_usage is None or self.live_at is None:
+            return self
+        if self.fetched_at is not None and self.fetched_at >= self.live_at:
+            return self
+        return replace(
+            self,
+            last_good={**(self.last_good or {}), **self.live_usage},
+            fetched_at=self.live_at,
+            age_s=self.live_age_s,
+        )
+
     def _live_overlay(self) -> dict | None:
         """The live windows while they are decision-grade, else ``None``.
 
