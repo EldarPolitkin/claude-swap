@@ -45,7 +45,12 @@ class TestProxyCommand:
 
     def test_prints_how_to_point_claude_code_at_it(self, temp_home, capsys):
         self._run(["--port", "9001"])
-        assert "ANTHROPIC_BASE_URL=http://127.0.0.1:9001" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "ANTHROPIC_BASE_URL=http://127.0.0.1:9001" in out
+        # Without it, Claude Code treats the proxy as a third-party host and
+        # sends every MCP tool definition up front (measured: 145,866 prompt
+        # tokens instead of 26,475 for the same one-word request).
+        assert "ENABLE_TOOL_SEARCH=true" in out
 
     def test_sigterm_stops_it_like_ctrl_c(self, temp_home, monkeypatch):
         import signal
@@ -72,6 +77,7 @@ class TestProxyCommand:
         assert excinfo.value.code == 0
         out = capsys.readouterr().out
         assert "ANTHROPIC_BASE_URL" in out
+        assert "ENABLE_TOOL_SEARCH=true" in out
         assert "--port" in out
 
 

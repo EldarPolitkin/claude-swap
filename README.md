@@ -331,8 +331,11 @@ The usage endpoint allows about 30 requests an hour per account, so a busy accou
 ```bash
 cswap proxy                                        # listens on 127.0.0.1:18999
 export ANTHROPIC_BASE_URL=http://127.0.0.1:18999   # every Claude Code session
+export ENABLE_TOOL_SEARCH=true                     # keep deferred tool loading (see below)
 cswap auto                                         # unchanged: now decides on live numbers
 ```
+
+**Set `ENABLE_TOOL_SEARCH=true` too.** With a base URL that is not Anthropic's own, Claude Code turns off deferred tool loading and sends every MCP tool definition with every request. Measured on one machine with many MCP servers (Claude Code 2.1.280, the same one-word `claude -p` request): 26,475 prompt tokens direct, 145,866 through the proxy, 26,504 through the proxy with `ENABLE_TOOL_SEARCH=true`. The proxy forwards tool-search requests unchanged, so the setting is safe. Claude Code also leaves out two experimental betas for a non-Anthropic base URL (`cache-diagnosis-2026-04-07`, `thinking-binding-controls-2026-08-01`); `ENABLE_TOOL_SEARCH` does not restore those.
 
 <details>
 <summary>How it works, and what it will not do</summary>

@@ -1067,6 +1067,12 @@ def _proxy_command(argv: list[str]) -> None:
         epilog=f"""
 Point Claude Code at it (every session, e.g. in your shell profile):
   export ANTHROPIC_BASE_URL=http://127.0.0.1:{proxy.DEFAULT_PORT}
+  export ENABLE_TOOL_SEARCH=true
+
+The second line matters: with a base URL that is not Anthropic's own,
+Claude Code turns off deferred tool loading and sends every MCP tool
+definition with every request (measured: 5.5x the prompt tokens for the
+same request). The proxy forwards tool-search requests unchanged.
 
 It listens on loopback only, forwards only to api.anthropic.com, and never
 stores or logs a token or a request/reply body. While it is not running,
@@ -1098,7 +1104,10 @@ supervisor (launchd, systemd, a container entrypoint) next to 'cswap auto'.
         def announce(host: str, port: int) -> None:
             print(f"cswap proxy listening on {host}:{port} - Ctrl-C to stop", flush=True)
             print(
-                dimmed(f"Start Claude Code with ANTHROPIC_BASE_URL=http://{host}:{port}"),
+                dimmed(
+                    f"Start Claude Code with ANTHROPIC_BASE_URL=http://{host}:{port} "
+                    "ENABLE_TOOL_SEARCH=true"
+                ),
                 flush=True,
             )
 
