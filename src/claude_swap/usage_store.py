@@ -314,9 +314,38 @@ class UsageEntry:
     # import-usage``) keeps every collector off this slot. Appended for the
     # same positional compatibility as ``claim_until``.
     held_until: float | None = None
+    # The 5h/7d windows ``cswap proxy`` read off the account's own API replies
+    # (``record_live``), when they were read and how old that is. Kept beside
+    # ``last_good``, never in it: the headers carry no per-model or spend
+    # windows, so the polled reading stays the only source of those, and
+    # ``fetched_at`` keeps meaning "last poll" for every scheduler. Appended
+    # for the same positional compatibility as ``claim_until``.
+    live_usage: dict | None = None
+    live_at: float | None = None
+    live_age_s: float | None = None
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
+        if self.live_at is not None and (now - self.live_at) <= ttl:
+            return True
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
+
+    def _live_overlay(self) -> dict | None:
+        """The live windows while they are decision-grade, else ``None``.
+
+        Trusted for ``STALE_OK_S`` (an idle session's last reply is no
+        current reading) and only while newer than the last poll, so a poll
+        that lands after it wins.
+        """
+        if (
+            self.live_usage is None
+            or self.live_at is None
+            or self.live_age_s is None
+            or self.live_age_s > STALE_OK_S
+        ):
+            return None
+        if self.fetched_at is not None and self.fetched_at >= self.live_at:
+            return None
+        return self.live_usage
 
     def in_backoff(self, now: float) -> bool:
         return self.backoff_until is not None and now < self.backoff_until
@@ -394,18 +423,25 @@ class UsageEntry:
 
         Sentinel wins; else last-good while it is recent enough to trust
         (≤ ``STALE_OK_S``, or ``trust_extended`` for deliberate staleness);
-        else None (unknown). Display code reads ``last_good``/``age_s``
-        directly instead — it may show older data, annotated with its age.
+        else None (unknown). A live reading newer than the poll replaces the
+        windows it measured (5h/7d) and keeps the rest from a trusted poll;
+        with no trusted poll it stands alone. Display code reads
+        ``last_good``/``age_s`` directly instead — it may show older data,
+        annotated with its age.
         """
         if self.sentinel is not None:
             return self.sentinel
+        polled = None
         if (
             self.last_good is not None
             and self.age_s is not None
             and (self.age_s <= STALE_OK_S or self.trust_extended)
         ):
-            return self.last_good
-        return None
+            polled = self.last_good
+        live = self._live_overlay()
+        if live is None:
+            return polled
+        return {**(polled or {}), **live}
 
 
 def _plan_oversleeps_interval(
@@ -957,6 +993,11 @@ class UsageStore:
                     or held
                 )
             )
+            live = row.get("liveReading")
+            live_usage = live.get("usage") if isinstance(live, dict) else None
+            live_at = _num_or_none(live.get("at")) if isinstance(live, dict) else None
+            if not isinstance(live_usage, dict) or live_at is None:
+                live_usage = live_at = None
             out[num] = UsageEntry(
                 last_good=last_good if isinstance(last_good, dict) else None,
                 fetched_at=fetched_at,
@@ -974,6 +1015,9 @@ class UsageStore:
                 trust_extended=trust_extended,
                 claim_until=claim_until,
                 held_until=held_until,
+                live_usage=live_usage,
+                live_at=live_at,
+                live_age_s=(now - live_at) if live_at is not None else None,
             )
         return out
 
@@ -1237,6 +1281,30 @@ class UsageStore:
 
         self._mutate(identities, readings.keys(), apply)
         return adopted
+
+    def record_live(
+        self,
+        readings: dict[str, dict],
+        identities: dict[str, Identity],
+    ) -> None:
+        """Store the 5h/7d windows read off an account's own API replies.
+
+        ``readings`` maps slot → the partial usage dict
+        :func:`live_usage.parse_ratelimit_headers` returns, measured now. It
+        goes to its own ``liveReading`` field, stamped with this store's
+        clock; ``lastGood``, ``fetchedAt`` and every fetch-state field are
+        left alone, so the poll cadence and what the poller measures (the
+        per-model and spend windows) are unchanged. ``decision_value`` lays
+        it over the polled reading while it is the newer of the two.
+        """
+        if not readings:
+            return
+        now = self.clock()
+
+        def apply(num: str, row: dict) -> None:
+            row["liveReading"] = {"usage": readings[num], "at": now}
+
+        self._mutate(identities, readings.keys(), apply)
 
     def set_poll_plan(
         self,
