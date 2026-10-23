@@ -222,6 +222,72 @@ class Upstream:
         return http.client.HTTPConnection(self.host, self.port, timeout=self.timeout_s)
 
 
+#: Idle upstream connections kept for reuse, and for how long. A new TLS
+#: connection to the API costs about 200 ms; Claude Code talking to the API
+#: directly reuses its own, so without this every proxied request would pay
+#: it. The idle bound stays well under a server's keep-alive timeout, so a
+#: reused connection is rarely one the server already closed (and when it is,
+#: the request is retried once on a fresh one).
+POOL_MAX_IDLE = 8
+POOL_IDLE_S = 20.0
+
+#: What a reused connection the server closed while idle raises on reuse.
+#: ``RemoteDisconnected`` is a ``ConnectionResetError``.
+_STALE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+
+
+class _Connector(Protocol):  # pragma: no cover - typing only
+    def connect(self) -> http.client.HTTPConnection: ...
+
+
+class UpstreamPool:
+    """Idle keep-alive connections to the upstream, most recent first."""
+
+    def __init__(
+        self,
+        upstream: _Connector,
+        clock: Callable[[], float] = time.monotonic,
+        max_idle: int = POOL_MAX_IDLE,
+        idle_s: float = POOL_IDLE_S,
+    ):
+        self._upstream = upstream
+        self._clock = clock
+        self._max_idle = max_idle
+        self._idle_s = idle_s
+        self._idle: list[tuple[http.client.HTTPConnection, float]] = []
+        self._lock = threading.Lock()
+
+    def acquire(self, fresh: bool = False) -> tuple[http.client.HTTPConnection, bool]:
+        """A connection, and whether it is a reused one."""
+        expired = []
+        try:
+            with self._lock:
+                now = self._clock()
+                while self._idle and not fresh:
+                    conn, released_at = self._idle.pop()
+                    if now - released_at <= self._idle_s:
+                        return conn, True
+                    expired.append(conn)
+        finally:
+            for conn in expired:
+                conn.close()
+        return self._upstream.connect(), False
+
+    def release(self, conn: http.client.HTTPConnection) -> None:
+        """Keep a connection whose reply was read to the end, if there is room."""
+        with self._lock:
+            if len(self._idle) < self._max_idle:
+                self._idle.append((conn, self._clock()))
+                return
+        conn.close()
+
+    def close_all(self) -> None:
+        with self._lock:
+            idle, self._idle = self._idle, []
+        for conn, _ in idle:
+            conn.close()
+
+
 class _Recorder(Protocol):  # pragma: no cover - typing only
     def observe(self, authorization: str | None, headers: Mapping[str, str]) -> str | None: ...
 
@@ -230,11 +296,19 @@ class ProxyServer(ThreadingHTTPServer):
     """One thread per connection, so long streams do not block each other."""
 
     daemon_threads = True
+    # The default backlog of 5 refuses connections when many sessions start
+    # requests at once (a fleet of agents behind one proxy).
+    request_queue_size = 128
 
     def __init__(self, address: tuple[str, int], recorder: _Recorder, upstream: Upstream):
         self.recorder = recorder
         self.upstream = upstream
+        self.pool = UpstreamPool(upstream)
         super().__init__(address, _Handler)
+
+    def server_close(self) -> None:
+        super().server_close()
+        self.pool.close_all()
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -282,12 +356,22 @@ class _Handler(BaseHTTPRequestHandler):
             self._refuse(400, "cswap proxy forwards origin-form requests only")
             return
         body = self._read_body()
-        conn = self.server.upstream.connect()
-        try:
+        headers_out = self._forward_headers()
+        pool = self.server.pool
+        fresh = False
+        while True:
+            conn, reused = pool.acquire(fresh=fresh)
             try:
-                conn.request(self.command, self.path, body=body or None, headers=self._forward_headers())
+                conn.request(self.command, self.path, body=body or None, headers=headers_out)
                 resp = conn.getresponse()
+                break
             except (OSError, http.client.HTTPException) as exc:
+                conn.close()
+                if reused and isinstance(exc, _STALE):
+                    # The server closed this idle connection before reading
+                    # the request; send it once more on a new connection.
+                    fresh = True
+                    continue
                 _logger.warning(
                     "proxy: %s %s: upstream %s unreachable: %s",
                     self.command,
@@ -297,16 +381,22 @@ class _Handler(BaseHTTPRequestHandler):
                 )
                 self._refuse(502, f"cswap proxy could not reach {self.server.upstream.host}")
                 return
+        reusable = False
+        try:
             headers = resp.getheaders()
             self.server.recorder.observe(self.headers.get("authorization"), dict(headers))
             _logger.debug(
                 "proxy: %s %s -> %d", self.command, self.path.split("?", 1)[0], resp.status
             )
-            self._send_reply(resp, headers)
+            reusable = self._send_reply(resp, headers) and not resp.will_close
         finally:
-            conn.close()
+            if reusable:
+                pool.release(conn)
+            else:
+                conn.close()
 
-    def _send_reply(self, resp: http.client.HTTPResponse, headers: list[tuple[str, str]]) -> None:
+    def _send_reply(self, resp: http.client.HTTPResponse, headers: list[tuple[str, str]]) -> bool:
+        """Relay the reply. Returns whether it was read to the end."""
         self.send_response_only(resp.status, resp.reason)
         for name, value in headers:
             if name.lower() not in _HOP_BY_HOP:
@@ -327,6 +417,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True  # the client went away mid-stream
+            return False
+        return True
 
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = _relay
 

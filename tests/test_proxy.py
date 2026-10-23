@@ -18,6 +18,7 @@ from claude_swap.proxy import (
     ProxyServer,
     SwitcherSlotResolver,
     Upstream,
+    UpstreamPool,
     fingerprint_bearer,
 )
 from claude_swap.usage_store import UsageStore
@@ -251,6 +252,9 @@ class FakeUpstream:
         self.between_chunks.set()
         self.chunked = True
         self.broken_pipe = threading.Event()
+        # Close the socket after a reply WITHOUT a "Connection: close" header:
+        # the client believes the connection is reusable and finds it dead.
+        self.drop_after_reply = False
         upstream = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -275,8 +279,11 @@ class FakeUpstream:
                         "path": self.path,
                         "headers": {k.lower(): v for k, v in self.headers.items()},
                         "body": body,
+                        "client": self.client_address,
                     }
                 )
+                if upstream.drop_after_reply:
+                    self.close_connection = True
                 self.send_response(upstream.status)
                 for k, v in upstream.headers.items():
                     self.send_header(k, v)
@@ -524,6 +531,124 @@ class TestConnections:
             reply = sock.recv(256)
         assert reply.startswith(b"HTTP/1.1 400") or reply.startswith(b"HTTP/1.0 400")
         assert upstream.requests == []
+
+
+class TestUpstreamReuse:
+    """A new TLS handshake to the API costs ~200 ms; Claude Code direct reuses
+    its connection, so the proxy must too or every request pays it."""
+
+    def test_sequential_requests_reuse_one_upstream_connection(self, running, upstream):
+        server, _ = running
+        for _ in range(3):
+            conn, resp = _post(server)
+            resp.read()
+            conn.close()
+        assert len({r["client"] for r in upstream.requests}) == 1
+
+    def test_a_connection_the_server_dropped_is_retried_once_fresh(self, running, upstream):
+        upstream.drop_after_reply = True
+        server, _ = running
+        for _ in range(3):
+            conn, resp = _post(server)
+            assert resp.status == 200
+            assert resp.read() == b"event: one\n\nevent: two\n\n"
+            conn.close()
+        assert len(upstream.requests) == 3
+        assert len({r["client"] for r in upstream.requests}) == 3
+
+    def test_a_reply_marked_close_is_not_reused(self, running, upstream):
+        upstream.headers = {**upstream.headers, "connection": "close"}
+        server, _ = running
+        for _ in range(2):
+            conn, resp = _post(server)
+            resp.read()
+            conn.close()
+        assert len({r["client"] for r in upstream.requests}) == 2
+
+    def test_a_stream_the_client_abandoned_is_not_reused(self, running, upstream):
+        upstream.chunks = [b"event: one\n\n"] + [b"x" * 65536] * 64
+        upstream.between_chunks.clear()
+        server, _ = running
+        conn, resp = _post(server)
+        resp.read1(64)
+        conn.sock.close()
+        conn.close()
+        upstream.between_chunks.set()
+        assert upstream.broken_pipe.wait(5)
+        upstream.chunks = [b"next"]
+        conn2, resp2 = _post(server)
+        assert resp2.read() == b"next"
+        conn2.close()
+        assert upstream.requests[0]["client"] != upstream.requests[1]["client"]
+
+    def test_a_listen_backlog_sized_for_a_fleet_of_sessions(self):
+        assert ProxyServer.request_queue_size >= 64
+
+
+class FakeConn:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class FakeUpstreamFactory:
+    def __init__(self):
+        self.made: list[FakeConn] = []
+
+    def connect(self):
+        conn = FakeConn()
+        self.made.append(conn)
+        return conn
+
+
+class TestUpstreamPool:
+    def test_a_released_connection_is_handed_out_again(self):
+        factory = FakeUpstreamFactory()
+        pool = UpstreamPool(factory, clock=FakeClock())
+        conn, reused = pool.acquire()
+        assert reused is False
+        pool.release(conn)
+        assert pool.acquire() == (conn, True)
+
+    def test_fresh_skips_the_idle_connections(self):
+        factory = FakeUpstreamFactory()
+        pool = UpstreamPool(factory, clock=FakeClock())
+        first, _ = pool.acquire()
+        pool.release(first)
+        conn, reused = pool.acquire(fresh=True)
+        assert conn is not first
+        assert reused is False
+
+    def test_idle_connections_expire(self):
+        factory = FakeUpstreamFactory()
+        clock = FakeClock()
+        pool = UpstreamPool(factory, clock=clock, idle_s=20.0)
+        old, _ = pool.acquire()
+        pool.release(old)
+        clock.advance(21)
+        conn, reused = pool.acquire()
+        assert conn is not old
+        assert reused is False
+        assert old.closed
+
+    def test_the_pool_is_capped(self):
+        factory = FakeUpstreamFactory()
+        pool = UpstreamPool(factory, clock=FakeClock(), max_idle=2)
+        conns = [pool.acquire()[0] for _ in range(4)]
+        for conn in conns:
+            pool.release(conn)
+        assert [c.closed for c in conns] == [False, False, True, True]
+
+    def test_close_all_closes_the_idle_connections(self):
+        factory = FakeUpstreamFactory()
+        pool = UpstreamPool(factory, clock=FakeClock())
+        conn, _ = pool.acquire()
+        pool.release(conn)
+        pool.close_all()
+        assert conn.closed
+        assert pool.acquire()[1] is False
 
 
 class TestRefusals:
